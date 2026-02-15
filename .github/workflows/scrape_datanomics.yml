@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        brand: [iphone]
+        brand: [iphone, samsung, xiaomi]
 
     steps:
       - name: Checkout
