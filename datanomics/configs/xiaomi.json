@@ -1,0 +1,9 @@
+{
+  "brand": "xiaomi",
+  "output_excel": "datanomics/outputs/ldlc_xiaomi.xlsx",
+  "state_file": "datanomics/state/xiaomi_state.json",
+  "listing_pages": [
+    "https://www.ldlc.com/telephonie/telephonie-portable/mobile-smartphone/c4416/+fb-C000036359+fps-1.html?sort=32",
+    "https://www.ldlc.com/telephonie/telephonie-portable/mobile-smartphone/c4416/page2/+fb-C000036359+fps-1.html?sort=32"
+  ]
+}
