@@ -4,12 +4,19 @@
 """
 Datanomics - LDLC tracker (brand-specific)
 
-Fixes:
+- Reads a config JSON (datanomics/configs/<brand>.json)
+- Scrapes listing pages to get product refs + names + product URLs
+- Enriches each product from product page (JSON-LD first, then safe DOM fallbacks):
+    price, availability, ratings, identifiers (gtin13/mpn/sku/brand)
+- Writes/updates an Excel history file (one per brand) with a price column per run (timestamp)
+
+Key fixes:
 - Clean product names (remove glued prices like "...659€00")
-- Prevent nonsense fallback prices (ex: phone numbers -> 1389051)
+- Avoid nonsense prices from full-page text (e.g., phone numbers -> 1389051)
 - Prefer JSON-LD; fallback to targeted DOM price only (NOT full page text)
 - Add availability_code and price_source
 - Force identifiers (gtin13/mpn/sku) as TEXT in Excel (no scientific notation)
+- If JSON-LD is missing on some runs (e.g. PB00516161), fallback to DOM specs / data-* for brand/mpn/sku.
 """
 
 import os
@@ -18,6 +25,7 @@ import json
 import time
 import html
 from urllib.parse import urljoin
+from typing import Optional, Dict, Any
 
 import requests
 import pandas as pd
@@ -43,11 +51,11 @@ SLEEP_BETWEEN_PRODUCTS_SEC = 0.35
 MAX_PRODUCT_PAGES_PER_RUN = 200
 MAX_EMPTY_RUNS = 3
 
-# Guardrails to avoid crazy values when fallback happens
+# Guardrails (avoid crazy values if fallback happens)
 MIN_PRICE_EUR = 30
 MAX_PRICE_EUR = 5000
-MAX_PRICE_MULT_VS_LISTING = 2.2   # if listing exists, product price must be <= 2.2x listing
-MIN_PRICE_MULT_VS_LISTING = 0.5   # and >= 0.5x listing
+MAX_PRICE_MULT_VS_LISTING = 2.2
+MIN_PRICE_MULT_VS_LISTING = 0.5
 
 
 # -------------------------
@@ -61,6 +69,10 @@ def _normalize_spaces(s: str) -> str:
 
 
 def clean_product_name(name: str) -> str:
+    """
+    Remove glued prices from listing anchor text, e.g.
+    "Apple iPhone 15 128 Go Noir659€00" -> "Apple iPhone 15 128 Go Noir"
+    """
     if not name:
         return name
     n = _normalize_spaces(name)
@@ -69,14 +81,14 @@ def clean_product_name(name: str) -> str:
     return _normalize_spaces(n)
 
 
-def safe_str(x):
+def safe_str(x) -> Optional[str]:
     if x is None:
         return None
     s = str(x).strip()
     return s if s else None
 
 
-def safe_float(x):
+def safe_float(x) -> Optional[float]:
     if x is None:
         return None
     try:
@@ -85,7 +97,7 @@ def safe_float(x):
         return None
 
 
-def normalize_availability(av: str):
+def normalize_availability(av: Optional[str]) -> Optional[str]:
     if not av:
         return None
     a = str(av)
@@ -104,7 +116,7 @@ def normalize_availability(av: str):
     return "OTHER"
 
 
-def is_price_plausible(price_eur: float, listing_price: float | None) -> bool:
+def is_price_plausible(price_eur: Optional[float], listing_price: Optional[float]) -> bool:
     if price_eur is None:
         return False
     if price_eur < MIN_PRICE_EUR or price_eur > MAX_PRICE_EUR:
@@ -191,7 +203,7 @@ def _is_installment_context(text: str, span_start: int, span_end: int) -> bool:
     return False
 
 
-def extract_cash_price(text: str):
+def extract_cash_price(text: str) -> Optional[float]:
     """
     Extract best candidate cash price from a text block.
     Filters monthly/installment contexts.
@@ -231,7 +243,7 @@ def extract_cash_price(text: str):
     return max(candidates)
 
 
-def extract_price_from_dom(soup: BeautifulSoup) -> float | None:
+def extract_price_from_dom(soup: BeautifulSoup) -> Optional[float]:
     """
     Safe fallback: target ONLY the main displayed price block.
     Avoid parsing the entire page text (which can include phone numbers, etc.)
@@ -261,7 +273,7 @@ def find_product_container(a_tag):
     for _ in range(10):
         if node is None:
             break
-        if node.select_one(".price"):
+        if getattr(node, "select_one", None) and node.select_one(".price"):
             return node
         node = node.parent
     return None
@@ -321,10 +333,14 @@ def scrape_listing_page(url: str):
 
 
 # -------------------------
-# Product page enrichment (JSON-LD)
+# Product page enrichment (JSON-LD + DOM fallback)
 # -------------------------
 
-def extract_product_jsonld(soup: BeautifulSoup) -> dict:
+def extract_product_jsonld(soup: BeautifulSoup) -> Dict[str, Any]:
+    """
+    Extract enriched fields from JSON-LD when available.
+    Identifiers are forced as strings (IDs are not numeric).
+    """
     out = {
         "price_eur": None,
         "availability": None,
@@ -357,7 +373,6 @@ def extract_product_jsonld(soup: BeautifulSoup) -> dict:
                     elif isinstance(b, str):
                         out["brand"] = safe_str(b) or out["brand"]
 
-                    # IMPORTANT: force as strings (IDs are not numeric)
                     out["mpn"] = safe_str(node.get("mpn")) or out["mpn"]
                     out["sku"] = safe_str(node.get("sku")) or out["sku"]
                     out["gtin13"] = safe_str(node.get("gtin13")) or out["gtin13"]
@@ -374,7 +389,6 @@ def extract_product_jsonld(soup: BeautifulSoup) -> dict:
                         if out["price_eur"] is None and "price" in offers:
                             out["price_eur"] = safe_float(offers.get("price"))
                         out["availability"] = safe_str(offers.get("availability")) or out["availability"]
-
                     elif isinstance(offers, list):
                         for of in offers:
                             if not isinstance(of, dict):
@@ -384,29 +398,87 @@ def extract_product_jsonld(soup: BeautifulSoup) -> dict:
                             out["availability"] = safe_str(of.get("availability")) or out["availability"]
 
                 stack.extend(node.values())
-
             elif isinstance(node, list):
                 stack.extend(node)
 
     return out
 
 
-def extract_availability_label(soup: BeautifulSoup) -> str:
+def extract_availability_label(soup: BeautifulSoup) -> Optional[str]:
+    """
+    Best-effort human label from DOM (can change).
+    """
     candidates = []
-    for sel in [".stock", ".product-stock", ".availability", ".in-stock", ".shipping", ".delivery",
-                "#product-page-stock .stock-contentCenter", ".stocks .stock-contentCenter"]:
+    for sel in [
+        ".stock", ".product-stock", ".availability", ".in-stock", ".shipping", ".delivery",
+        "#product-page-stock .stock-contentCenter",
+        ".stocks .stock-contentCenter",
+    ]:
         el = soup.select_one(sel)
         if el:
             txt = _normalize_spaces(" ".join(el.stripped_strings))
-            if txt and len(txt) <= 140:
+            if txt and len(txt) <= 160:
                 candidates.append(txt)
     return candidates[0] if candidates else None
 
 
-def enrich_from_product_page(url: str, listing_price: float | None) -> dict:
+def extract_ids_from_dom(soup: BeautifulSoup) -> Dict[str, Optional[str]]:
+    """
+    Fallback DOM when JSON-LD is missing:
+    - mpn: from data-constructor-id OR "Fiche technique" row "Modèle"
+    - sku: from data-product-id / data-offer-id (if present)
+    - brand: from "Fiche technique" row "Marque"
+    """
+    out = {"brand": None, "mpn": None, "sku": None}
+
+    # 1) data-* attributes (when present)
+    # Many LDLC pages include product IDs in data attributes on some root nodes.
+    root_candidates = [
+        soup.select_one("[data-product-id]"),
+        soup.select_one("[data-offer-id]"),
+        soup.select_one("[data-constructor-id]"),
+        soup.select_one("body"),
+    ]
+    root = next((x for x in root_candidates if x is not None), None)
+    if root is not None and hasattr(root, "get"):
+        out["mpn"] = safe_str(root.get("data-constructor-id")) or out["mpn"]
+        out["sku"] = safe_str(root.get("data-product-id")) or safe_str(root.get("data-offer-id")) or out["sku"]
+
+    # 2) Fiche technique table (id=product-parameters)
+    table = soup.select_one("table#product-parameters")
+    if table:
+        for tr in table.select("tr"):
+            label_el = tr.select_one("td.label h3")
+            value_el = tr.select_one("td.checkbox")
+            if not label_el or not value_el:
+                continue
+            label = _normalize_spaces(label_el.get_text(" ", strip=True)).lower()
+            value = _normalize_spaces(value_el.get_text(" ", strip=True))
+            if not value:
+                continue
+
+            if label == "marque" and out["brand"] is None:
+                # often "Apple" already clean; keep first token if weird duplication
+                out["brand"] = safe_str(value.split()[0])
+            elif label == "modèle" and out["mpn"] is None:
+                out["mpn"] = safe_str(value)
+
+    return out
+
+
+def enrich_from_product_page(url: str, listing_price: Optional[float]) -> Dict[str, Any]:
     soup = get_soup(url)
+
     enriched = extract_product_jsonld(soup)
 
+    # If JSON-LD missed identifiers, fallback to DOM (prevents NaN for PB00516161)
+    if not enriched.get("brand") or not enriched.get("mpn") or not enriched.get("sku"):
+        dom_ids = extract_ids_from_dom(soup)
+        enriched["brand"] = enriched.get("brand") or dom_ids.get("brand")
+        enriched["mpn"] = enriched.get("mpn") or dom_ids.get("mpn")
+        enriched["sku"] = enriched.get("sku") or dom_ids.get("sku")
+
+    # Price handling
     price = enriched.get("price_eur")
     source = "jsonld" if price is not None else None
 
@@ -419,7 +491,6 @@ def enrich_from_product_page(url: str, listing_price: float | None) -> dict:
 
     # Validate price with guardrails
     if not is_price_plausible(price, listing_price):
-        # If listing is plausible, prefer it
         if is_price_plausible(listing_price, None):
             price = listing_price
             source = "listing"
@@ -431,11 +502,12 @@ def enrich_from_product_page(url: str, listing_price: float | None) -> dict:
     enriched["price_source"] = source
     enriched["availability_label"] = extract_availability_label(soup)
     enriched["availability_code"] = normalize_availability(enriched.get("availability"))
+
     return enriched
 
 
 # -------------------------
-# Excel history + TEXT columns formatting
+# Excel history + TEXT columns handling
 # -------------------------
 
 def update_excel_history(df_run: pd.DataFrame, excel_file: str, sheet_name: str = "Suivi"):
@@ -443,7 +515,7 @@ def update_excel_history(df_run: pd.DataFrame, excel_file: str, sheet_name: str 
 
     df_run = df_run.copy()
 
-    # Ensure IDs stay as strings (important before writing)
+    # Ensure IDs stay strings (important before write)
     for c in ["gtin13", "mpn", "sku"]:
         if c in df_run.columns:
             df_run[c] = df_run[c].apply(lambda x: safe_str(x))
@@ -469,10 +541,15 @@ def update_excel_history(df_run: pd.DataFrame, excel_file: str, sheet_name: str 
     keep_cols = [c for c in fixed_cols if c in df_run.columns] + [timestamp]
     df_run = df_run[keep_cols]
 
-    # Load existing
+    # Load existing (FORCE dtype=str for IDs to prevent scientific notation on read)
     if os.path.exists(excel_file):
         try:
-            df_hist = pd.read_excel(excel_file, sheet_name=sheet_name, engine="openpyxl")
+            df_hist = pd.read_excel(
+                excel_file,
+                sheet_name=sheet_name,
+                engine="openpyxl",
+                dtype={"reference": str, "gtin13": str, "mpn": str, "sku": str},
+            )
             if not df_hist.empty and "reference" in df_hist.columns:
                 df_hist = df_hist.set_index("reference")
             else:
@@ -483,9 +560,11 @@ def update_excel_history(df_run: pd.DataFrame, excel_file: str, sheet_name: str 
     else:
         df_hist = pd.DataFrame().set_index(pd.Index([], name="reference"))
 
+    # Merge history + current run
     df_merged = df_hist.combine_first(df_run)
     df_merged[timestamp] = df_run[timestamp].reindex(df_merged.index)
 
+    # Update fixed fields if new values exist
     for col in fixed_cols:
         if col in df_run.columns:
             if col in df_merged.columns:
@@ -500,17 +579,25 @@ def update_excel_history(df_run: pd.DataFrame, excel_file: str, sheet_name: str 
     stable_cols = [c for c in ["reference"] + fixed_cols if c in df_out.columns]
     ordered_cols = stable_cols + sorted(ts_cols)
 
+    # Keep any unexpected columns at the end
     remaining = [c for c in df_out.columns if c not in ordered_cols]
     df_out = df_out[ordered_cols + remaining]
 
+    # Force IDs to str in final output (double safety)
+    for c in ["gtin13", "mpn", "sku"]:
+        if c in df_out.columns:
+            df_out[c] = df_out[c].apply(lambda x: safe_str(x))
+
+    # Sort by latest run price then name
     df_out = df_out.sort_values(by=[timestamp, "nom"], na_position="last")
 
     os.makedirs(os.path.dirname(excel_file), exist_ok=True)
 
+    # Write Excel
     with pd.ExcelWriter(excel_file, engine="openpyxl", mode="w") as writer:
         df_out.to_excel(writer, sheet_name=sheet_name, index=False)
 
-        # Force TEXT format for mpn/sku/gtin13 in Excel
+        # Force TEXT format for mpn/sku/gtin13 in Excel cells
         ws = writer.book[sheet_name]
         header = [cell.value for cell in ws[1]]
         col_map = {name: idx + 1 for idx, name in enumerate(header) if name}
@@ -523,7 +610,6 @@ def update_excel_history(df_run: pd.DataFrame, excel_file: str, sheet_name: str 
                     if cell.value is None:
                         continue
                     cell.number_format = "@"
-                    # Ensure stored as string
                     cell.value = str(cell.value)
 
     print(f"Excel mis à jour : {excel_file} | run={timestamp} | produits={len(df_run)}")
@@ -567,9 +653,7 @@ def run_brand(config_path: str):
         save_state(state_file, state)
         print(f"Aucun produit récupéré. empty_runs={state['empty_runs']} (seuil={MAX_EMPTY_RUNS})")
         if state["empty_runs"] >= MAX_EMPTY_RUNS:
-            raise RuntimeError(
-                f"Aucun produit récupéré pendant {state['empty_runs']} runs consécutifs."
-            )
+            raise RuntimeError(f"Aucun produit récupéré pendant {state['empty_runs']} runs consécutifs.")
         return
 
     state["empty_runs"] = 0
@@ -586,6 +670,7 @@ def run_brand(config_path: str):
             enriched = enrich_from_product_page(r["url_produit"], listing_price=listing_price)
         except Exception as e:
             print(f"    !! enrich KO {r['reference']} : {e}")
+            # minimal safe fallback
             enriched = {
                 "price_eur": listing_price if is_price_plausible(listing_price, None) else None,
                 "price_source": "listing" if is_price_plausible(listing_price, None) else "missing",
