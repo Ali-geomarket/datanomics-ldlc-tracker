@@ -8,7 +8,13 @@ Datanomics - LDLC tracker (brand-specific)
 - Scrapes listing pages to get product refs + names + product URLs
 - Enriches each product from its product page using JSON-LD:
     price, availability, ratings, identifiers (gtin/mpn/sku)
-- Writes/updates an Excel history file (one per brand)
+- Writes/updates an Excel history file (one per brand) with a price column per run (timestamp)
+
+Fixes included:
+- Clean product names (remove glued prices like "...659€00")
+- Force identifiers (gtin13/mpn/sku) as strings to avoid Excel scientific notation
+- Add availability_code (human/analysis-friendly)
+- Add price_source to assess reliability
 """
 
 import os
@@ -43,13 +49,80 @@ SLEEP_BETWEEN_PRODUCTS_SEC = 0.35
 # To avoid triggering LDLC protections too often
 MAX_PRODUCT_PAGES_PER_RUN = 200  # safety cap
 
+# Monitoring: empty runs
+MAX_EMPTY_RUNS = 3
+
+
+# -------------------------
+# Utilities
+# -------------------------
+
+def _normalize_spaces(s: str) -> str:
+    s = (s or "").replace("\xa0", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def clean_product_name(name: str) -> str:
+    """
+    Remove glued prices from listing anchor text, e.g.:
+    "Apple iPhone 15 128 Go Noir659€00" -> "Apple iPhone 15 128 Go Noir"
+    """
+    if not name:
+        return name
+    n = _normalize_spaces(name)
+
+    # Remove patterns like 659€00 or 659 € 00
+    n = re.sub(r"\d{1,5}\s*€\s*\d{2}\b", "", n)
+    # Remove patterns like 659€ (rare)
+    n = re.sub(r"\d{1,5}\s*€\b", "", n)
+
+    return _normalize_spaces(n)
+
+
+def safe_str(x):
+    if x is None:
+        return None
+    s = str(x).strip()
+    return s if s != "" else None
+
+
+def safe_float(x):
+    if x is None:
+        return None
+    try:
+        return float(str(x).replace(",", "."))
+    except Exception:
+        return None
+
+
+def normalize_availability(av: str):
+    """
+    Normalize schema.org availability URL to a short code for analysis.
+    """
+    if not av:
+        return None
+    a = str(av)
+
+    if "InStock" in a:
+        return "IN_STOCK"
+    if "OutOfStock" in a:
+        return "OUT_OF_STOCK"
+    if "BackOrder" in a:
+        return "BACKORDER"
+    if "PreOrder" in a:
+        return "PREORDER"
+    if "LimitedAvailability" in a:
+        return "LIMITED"
+    if "SoldOut" in a:
+        return "SOLD_OUT"
+
+    return "OTHER"
+
 
 # -------------------------
 # Monitoring: empty runs
 # -------------------------
-
-MAX_EMPTY_RUNS = 3
-
 
 def load_state(state_file: str) -> dict:
     if os.path.exists(state_file):
@@ -103,12 +176,6 @@ def get_soup(url: str) -> BeautifulSoup:
 # Price extraction (robust)
 # -------------------------
 
-def _normalize_spaces(s: str) -> str:
-    s = (s or "").replace("\xa0", " ")
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-
 def _is_installment_context(text: str, span_start: int, span_end: int) -> bool:
     left = max(0, span_start - 18)
     right = min(len(text), span_end + 18)
@@ -129,6 +196,10 @@ def _is_installment_context(text: str, span_start: int, span_end: int) -> bool:
 
 
 def extract_cash_price(text: str):
+    """
+    Extract best candidate cash price from a text block.
+    Filters monthly/installment contexts.
+    """
     if not text:
         return None
 
@@ -197,13 +268,15 @@ def scrape_listing_page(url: str):
         if ref in seen_refs:
             continue
 
-        name = a.get_text(strip=True) or ""
+        raw_name = a.get_text(strip=True) or ""
+        name = clean_product_name(raw_name)
+
         if not name:
             parent = a.find_parent()
             if parent:
                 title = parent.select_one(".title, .title-3, h3, .txt span")
                 if title:
-                    name = title.get_text(strip=True)
+                    name = clean_product_name(title.get_text(strip=True))
 
         if not name:
             continue
@@ -238,7 +311,8 @@ def scrape_listing_page(url: str):
 
 def extract_product_jsonld(soup: BeautifulSoup) -> dict:
     """
-    Returns enriched fields from JSON-LD when available.
+    Extract enriched fields from JSON-LD when available.
+    Forces IDs to string to avoid Excel scientific notation.
     """
     out = {
         "price_eur": None,
@@ -265,44 +339,37 @@ def extract_product_jsonld(soup: BeautifulSoup) -> dict:
         while stack:
             node = stack.pop()
             if isinstance(node, dict):
-                # product-like node
+                # Detect product-like node
                 if node.get("@type") in ("Product", ["Product"]) or "offers" in node:
-                    if "brand" in node:
-                        b = node.get("brand")
-                        if isinstance(b, dict):
-                            out["brand"] = b.get("name") or out["brand"]
-                        elif isinstance(b, str):
-                            out["brand"] = b
+                    b = node.get("brand")
+                    if isinstance(b, dict):
+                        out["brand"] = safe_str(b.get("name")) or out["brand"]
+                    elif isinstance(b, str):
+                        out["brand"] = safe_str(b) or out["brand"]
 
-                    out["mpn"] = node.get("mpn") or out["mpn"]
-                    out["sku"] = node.get("sku") or out["sku"]
-                    out["gtin13"] = node.get("gtin13") or out["gtin13"]
+                    out["mpn"] = safe_str(node.get("mpn")) or out["mpn"]
+                    out["sku"] = safe_str(node.get("sku")) or out["sku"]
+                    out["gtin13"] = safe_str(node.get("gtin13")) or out["gtin13"]
 
                     ar = node.get("aggregateRating")
                     if isinstance(ar, dict):
-                        out["ratingValue"] = ar.get("ratingValue") or out["ratingValue"]
-                        out["reviewCount"] = ar.get("reviewCount") or ar.get("ratingCount") or out["reviewCount"]
+                        out["ratingValue"] = safe_float(ar.get("ratingValue")) or out["ratingValue"]
+                        rc = ar.get("reviewCount") or ar.get("ratingCount")
+                        out["reviewCount"] = int(rc) if str(rc).isdigit() else out["reviewCount"]
 
                     offers = node.get("offers")
                     if isinstance(offers, dict):
-                        if "price" in offers and out["price_eur"] is None:
-                            try:
-                                out["price_eur"] = float(str(offers["price"]).replace(",", "."))
-                            except Exception:
-                                pass
-                        out["availability"] = offers.get("availability") or out["availability"]
+                        if out["price_eur"] is None and "price" in offers:
+                            out["price_eur"] = safe_float(offers.get("price"))
+                        out["availability"] = safe_str(offers.get("availability")) or out["availability"]
 
-                    if isinstance(offers, list):
-                        # take the "best" offer (first with a price)
+                    elif isinstance(offers, list):
                         for of in offers:
                             if not isinstance(of, dict):
                                 continue
-                            if "price" in of and out["price_eur"] is None:
-                                try:
-                                    out["price_eur"] = float(str(of["price"]).replace(",", "."))
-                                except Exception:
-                                    pass
-                            out["availability"] = of.get("availability") or out["availability"]
+                            if out["price_eur"] is None and "price" in of:
+                                out["price_eur"] = safe_float(of.get("price"))
+                            out["availability"] = safe_str(of.get("availability")) or out["availability"]
 
                 stack.extend(node.values())
 
@@ -314,16 +381,14 @@ def extract_product_jsonld(soup: BeautifulSoup) -> dict:
 
 def extract_availability_label(soup: BeautifulSoup) -> str:
     """
-    Best-effort 'human readable' label (ex: 'En stock', 'Livré après-demain').
-    This is optional; DOM can change, so keep it tolerant.
+    Best-effort human label from DOM (can change).
     """
     candidates = []
     for sel in [".stock", ".product-stock", ".availability", ".in-stock", ".shipping", ".delivery"]:
         el = soup.select_one(sel)
         if el:
-            txt = " ".join(el.stripped_strings)
-            txt = _normalize_spaces(txt)
-            if txt and len(txt) <= 120:
+            txt = _normalize_spaces(" ".join(el.stripped_strings))
+            if txt and len(txt) <= 140:
                 candidates.append(txt)
     return candidates[0] if candidates else None
 
@@ -336,8 +401,12 @@ def enrich_from_product_page(url: str) -> dict:
     if enriched.get("price_eur") is None:
         page_txt = soup.get_text(" ", strip=True)
         enriched["price_eur"] = extract_cash_price(page_txt)
+        enriched["price_source"] = "fallback_text"
+    else:
+        enriched["price_source"] = "jsonld"
 
     enriched["availability_label"] = extract_availability_label(soup)
+    enriched["availability_code"] = normalize_availability(enriched.get("availability"))
     return enriched
 
 
@@ -354,15 +423,17 @@ def update_excel_history(df_run: pd.DataFrame, excel_file: str, sheet_name: str 
 
     fixed_cols = [
         "nom",
-        "url_produit",
         "brand",
+        "mpn",
+        "sku",
+        "gtin13",
+        "availability_code",
         "availability",
         "availability_label",
         "ratingValue",
         "reviewCount",
-        "gtin13",
-        "mpn",
-        "sku",
+        "price_source",
+        "url_produit",
     ]
 
     keep_cols = [c for c in fixed_cols if c in df_run.columns] + [timestamp]
@@ -394,7 +465,19 @@ def update_excel_history(df_run: pd.DataFrame, excel_file: str, sheet_name: str 
             else:
                 df_merged[col] = df_run[col]
 
+    # Final output ordering: fixed columns first + all timestamps at the end
     df_out = df_merged.reset_index()
+
+    # Identify timestamp columns (runs): they match "YYYY-MM-DD HH:MM:SS"
+    ts_cols = [c for c in df_out.columns if re.match(r"^\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}$", str(c))]
+    stable_cols = [c for c in ["reference"] + fixed_cols if c in df_out.columns]
+    ordered_cols = stable_cols + sorted(ts_cols)
+
+    # Keep any unexpected columns (just in case) at the end
+    remaining = [c for c in df_out.columns if c not in ordered_cols]
+    df_out = df_out[ordered_cols + remaining]
+
+    # Sort by latest timestamp price then name
     df_out = df_out.sort_values(by=[timestamp, "nom"], na_position="last")
 
     os.makedirs(os.path.dirname(excel_file), exist_ok=True)
@@ -450,30 +533,56 @@ def run_brand(config_path: str):
     state["empty_runs"] = 0
     save_state(state_file, state)
 
-    # Enrich from product pages
     enriched_rows = []
     for i, r in enumerate(all_rows[:MAX_PRODUCT_PAGES_PER_RUN], start=1):
         print(f"  [{i}/{len(all_rows)}] {r['reference']} - enrich…")
         time.sleep(SLEEP_BETWEEN_PRODUCTS_SEC)
+
+        enriched = {}
         try:
             enriched = enrich_from_product_page(r["url_produit"])
         except Exception as e:
             print(f"    !! enrich KO {r['reference']} : {e}")
-            enriched = {}
+            enriched = {
+                "price_eur": None,
+                "availability": None,
+                "availability_label": None,
+                "availability_code": None,
+                "ratingValue": None,
+                "reviewCount": None,
+                "gtin13": None,
+                "mpn": None,
+                "sku": None,
+                "brand": None,
+                "price_source": None,
+            }
+
+        # Decide price + source
+        price_eur = enriched.get("price_eur")
+        price_source = enriched.get("price_source")
+
+        if price_eur is None and r.get("prix_listing") is not None:
+            price_eur = r.get("prix_listing")
+            price_source = "listing"
+
+        if price_eur is None:
+            price_source = price_source or "missing"
 
         row = {
             "reference": r["reference"],
-            "nom": r["nom"],
+            "nom": clean_product_name(r["nom"]),
             "url_produit": r["url_produit"],
-            "price_eur": enriched.get("price_eur") or r.get("prix_listing"),
-            "brand": enriched.get("brand"),
-            "availability": enriched.get("availability"),
-            "availability_label": enriched.get("availability_label"),
+            "price_eur": price_eur,
+            "price_source": price_source,
+            "brand": safe_str(enriched.get("brand")),
+            "availability": safe_str(enriched.get("availability")),
+            "availability_code": safe_str(enriched.get("availability_code")),
+            "availability_label": safe_str(enriched.get("availability_label")),
             "ratingValue": enriched.get("ratingValue"),
             "reviewCount": enriched.get("reviewCount"),
-            "gtin13": enriched.get("gtin13"),
-            "mpn": enriched.get("mpn"),
-            "sku": enriched.get("sku"),
+            "gtin13": safe_str(enriched.get("gtin13")),
+            "mpn": safe_str(enriched.get("mpn")),
+            "sku": safe_str(enriched.get("sku")),
         }
         enriched_rows.append(row)
 
@@ -484,8 +593,8 @@ def run_brand(config_path: str):
 
 
 if __name__ == "__main__":
-    # Default: iPhone (simple)
-    # In GitHub Actions we will call: python datanomics/src/run.py datanomics/configs/iphone.json
+    # In GitHub Actions:
+    # python datanomics/src/run.py datanomics/configs/iphone.json
     import sys
     config = sys.argv[1] if len(sys.argv) > 1 else "datanomics/configs/iphone.json"
     run_brand(config)
