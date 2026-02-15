@@ -1,0 +1,9 @@
+{
+  "brand": "samsung",
+  "output_excel": "datanomics/outputs/ldlc_samsung.xlsx",
+  "state_file": "datanomics/state/samsung_state.json",
+  "listing_pages": [
+    "https://www.ldlc.com/telephonie/telephonie-portable/mobile-smartphone/c4416/+fb-C000001080+fps-1.html?sort=32",
+    "https://www.ldlc.com/telephonie/telephonie-portable/mobile-smartphone/c4416/page2/+fb-C000001080+fps-1.html?sort=32"
+  ]
+}
